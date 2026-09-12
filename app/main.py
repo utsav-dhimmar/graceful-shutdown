@@ -1,11 +1,13 @@
 import asyncio
 import logging
-import random
 from contextlib import asynccontextmanager
-from types import CoroutineType
-from typing import Any
 
+import httpx
 from fastapi import FastAPI
+from fastapi import status as HttpStatusCode
+from fastapi.responses import JSONResponse
+from httpx import Response
+from pydantic import BaseModel, HttpUrl
 
 logger = logging.getLogger(__name__)
 
@@ -13,31 +15,35 @@ logger = logging.getLogger(__name__)
 class WorkerException(Exception): ...
 
 
-async def worker() -> CoroutineType[Any, Any, None]:
-    while True:
-        print("working...")
-        await asyncio.sleep(1)
+class Worker(BaseModel):
+    http_url: HttpUrl
 
 
-async def worker_two() -> CoroutineType[Any, Any, None]:
-    while True:
-        guess = random.randint(1, 10)
-        print(f"this is worker two {guess}")
-        if guess == 5:
-            raise WorkerException("got magic number ")
-        await asyncio.sleep(delay=guess)
+class WorkerResponse(BaseModel):
+    message: str
+    url: HttpUrl
+    response: str
+
+
+class WorkerFailedResponse(BaseModel):
+    message: str = "something went wrong"
+    error: str | None
+
+
+async def get_httpx_async_client(timeout: int = 10) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Startup")
-    async with asyncio.TaskGroup() as tg:
-        task_2 = tg.create_task(coro=worker_two(), name="worker_2")
-        task_1 = tg.create_task(coro=worker(), name="worker_1")
+
+    client = await get_httpx_async_client()
+    app.state.client = client
 
     yield
-    loop = asyncio.get_running_loop()
-    # print(loop)
+
+    await client.aclose()
 
     logger.info("Shutdown complete.")
 
@@ -54,3 +60,32 @@ def root():
 async def work():
     await asyncio.sleep(10)
     return {"status": "done"}
+
+
+@app.post(
+    "/worker",
+    response_model=WorkerResponse,
+    responses={
+        HttpStatusCode.HTTP_200_OK: {"model": WorkerResponse},
+        HttpStatusCode.HTTP_400_BAD_REQUEST: {"model": WorkerFailedResponse},
+    },
+)
+async def worker(data: Worker):
+    async with app.state.client as client:
+        try:
+            response: Response = await client.get(
+                data.http_url.encoded_string()
+            )
+
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            # raise WorkerException(f"Failed to fetch URL: {e}")
+            return JSONResponse(
+                status_code=HttpStatusCode.HTTP_400_BAD_REQUEST,
+                content={"message": "something went wrong", "error": f"{e}"},
+            )
+    return {
+        "message": "Worker is running",
+        "url": data.http_url,
+        "response": str(response.content),
+    }
